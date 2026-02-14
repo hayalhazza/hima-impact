@@ -1,0 +1,256 @@
+import dotenv from "dotenv";
+dotenv.config();
+
+import express from "express";
+import cors from "cors";
+import OpenAI from "openai";
+import PDFDocument from "pdfkit";
+import path from "path";
+import { fileURLToPath } from "url";
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+const app = express();
+
+// نخدم الواجهة من نفس السيرفر
+app.use(express.static(path.join(__dirname, "public")));
+
+// (ممكن تلغينه لاحقًا) لكنه ما يضر
+app.use(cors());
+app.use(express.json({ limit: "2mb" }));
+
+const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+
+app.get("/health", (req, res) => res.json({ ok: true }));
+
+function normalizeResult(data) {
+  const score = Number(data?.score);
+  const gaps = data?.gaps || data?.counts || {};
+  const subs = data?.subs || {};
+
+  return {
+    score: Number.isFinite(score) ? Math.max(0, Math.min(100, score)) : 0,
+    gaps: {
+      high: Number(gaps.high ?? 0),
+      mid: Number(gaps.mid ?? gaps.med ?? 0),
+      low: Number(gaps.low ?? 0),
+    },
+    subs: {
+      "الإحاطة الواجبة": Number(subs["الإحاطة الواجبة"] ?? 0),
+      "الموافقة والعدول": Number(subs["الموافقة والعدول"] ?? 0),
+      "الاحتفاظ والإتلاف": Number(subs["الاحتفاظ والإتلاف"] ?? 0),
+    },
+    details: String(data?.details || ""),
+    suggestions: Array.isArray(data?.suggestions) ? data.suggestions : [],
+    observations: Array.isArray(data?.observations) ? data.observations : [],
+  };
+}
+
+// ✅ API: تحليل (JSON)
+app.post("/api/analyze", async (req, res) => {
+  try {
+    const text = String(req.body?.text || "").trim();
+    if (!text) return res.status(400).json({ error: "Missing text" });
+
+    const prompt = `
+أنت محرك "حِمى" لتقييم الجاهزية التنظيمية لنص عربي.
+قواعد مهمة:
+- لا تضف معلومات خارج النص.
+- أعطِ تقييمًا رقميًا 0-100.
+- أعطِ gaps للفئات (high/mid/low) كأرقام.
+- أعطِ subs للأقسام الثلاثة (0-100) بحسب قوة النص في كل محور.
+- أعطِ details نص تفصيلي رسمي (بدون ذكر كلمة "فجوات" إطلاقًا).
+- أعطِ suggestions كقائمة اقتراحات إعادة صياغة (قبل/بعد + سبب).
+
+أرجع JSON فقط بهذه البنية:
+{
+  "score": 0-100,
+  "gaps": {"high":0,"mid":0,"low":0},
+  "subs": {"الإحاطة الواجبة":0-100,"الموافقة والعدول":0-100,"الاحتفاظ والإتلاف":0-100},
+  "observations": [{"area":"الإحاطة الواجبة|الموافقة والعدول|الاحتفاظ والإتلاف|عام","text":"..."}],
+  "suggestions": [{"topic":"...","before":"...","after":"...","reason":"..."}],
+  "details": "نص تفصيلي رسمي"
+}
+
+النص:
+"""${text}"""
+`.trim();
+
+    const resp = await client.responses.create({
+      model: "gpt-4.1-mini",
+      input: prompt,
+      text: { format: { type: "json_object" } },
+    });
+
+    let parsed = {};
+    try {
+      parsed = JSON.parse(resp.output_text || "{}");
+    } catch {
+      parsed = {};
+    }
+
+    return res.json(normalizeResult(parsed));
+  } catch (e) {
+    return res.status(e?.status || 500).json({
+      error: e?.message || "Server error",
+      status: e?.status,
+      code: e?.code,
+    });
+  }
+});
+
+// ✅ API: تقرير PDF رسمي
+app.post("/api/report-pdf", async (req, res) => {
+  try {
+    const text = String(req.body?.text || "").trim();
+    if (!text) return res.status(400).json({ error: "Missing text" });
+
+    const analyzeResp = await client.responses.create({
+      model: "gpt-4.1-mini",
+      input: `
+أنت محرك "حِمى" وتكتب تقريرًا رسميًا عربيًا تفصيليًا بناءً على النص فقط.
+مهم جدًا: لا تستخدم كلمة "فجوات" إطلاقًا.
+أخرج JSON فقط بهذه البنية:
+{
+  "title":"تقرير حِمى الرسمي",
+  "date":"(تاريخ مختصر)",
+  "score":0-100,
+  "classification":"مستقر|تعرض متوسط|تعرض مرتفع|تعرض حرج",
+  "executive_summary":["...","...","..."],
+  "observations":[{"area":"...","text":"..."}],
+  "rewrite_suggestions":[{"topic":"...","before":"...","after":"...","reason":"..."}],
+  "recommended_actions":["...","...","..."],
+  "closing_note":"..."
+}
+
+النص:
+"""${text}"""
+`.trim(),
+      text: { format: { type: "json_object" } },
+    });
+
+    let report = {};
+    try {
+      report = JSON.parse(analyzeResp.output_text || "{}");
+    } catch {
+      report = {};
+    }
+
+    res.setHeader("Content-Type", "application/pdf");
+    res.setHeader("Content-Disposition", "attachment; filename=hima-report.pdf");
+
+    const doc = new PDFDocument({ size: "A4", margin: 50 });
+    doc.pipe(res);
+
+    // ✅ خط عربي (اختياري)
+    try {
+      doc.font(path.join(__dirname, "fonts", "NotoNaskhArabic-Regular.ttf"));
+    } catch {
+      // إذا ما وجد الخط، يكمل بالخط الافتراضي
+    }
+
+    const rtl = (t, opts = {}) => doc.text(t || "", { align: "right", ...opts });
+
+    const line = () => {
+      doc.moveDown(0.6);
+      doc.strokeColor("#E5E7EB").lineWidth(1).moveTo(50, doc.y).lineTo(545, doc.y).stroke();
+      doc.moveDown(0.8);
+      doc.fillColor("#111827");
+    };
+
+    doc.fillColor("#111827");
+    doc.fontSize(20);
+    rtl(report.title || "تقرير حِمى الرسمي");
+
+    doc.moveDown(0.4);
+    doc.fontSize(11);
+    rtl(`التاريخ: ${report.date || new Date().toLocaleDateString("ar-SA")}`);
+    rtl("النوع: تقرير جاهزية تنظيمية");
+    doc.moveDown(0.6);
+
+    doc.fontSize(11);
+    rtl(`الدرجة: ${Number(report.score ?? 0)} / 100`);
+    rtl(`التصنيف: ${report.classification || "—"}`);
+
+    line();
+
+    doc.fontSize(13);
+    rtl("أولاً: النص المُدخل", { underline: true });
+    doc.moveDown(0.5);
+    doc.fontSize(11);
+    rtl(text);
+
+    line();
+
+    doc.fontSize(13);
+    rtl("ثانيًا: الملخص التنفيذي", { underline: true });
+    doc.moveDown(0.5);
+    doc.fontSize(11);
+    (report.executive_summary || []).forEach((x) => rtl(`• ${x}`));
+
+    line();
+
+    doc.fontSize(13);
+    rtl("ثالثًا: الملاحظات الرئيسية", { underline: true });
+    doc.moveDown(0.5);
+    doc.fontSize(11);
+    const obs = report.observations || [];
+    if (!obs.length) rtl("—");
+    obs.forEach((o) => rtl(`• (${o.area || "عام"}) ${o.text || ""}`));
+
+    line();
+
+    doc.fontSize(13);
+    rtl("رابعًا: اقتراحات إعادة الصياغة (قبل / بعد)", { underline: true });
+    doc.moveDown(0.5);
+    doc.fontSize(11);
+    const rs = report.rewrite_suggestions || [];
+    if (!rs.length) rtl("—");
+    rs.slice(0, 10).forEach((r, i) => {
+      rtl(`${i + 1}) الموضوع: ${r.topic || "—"}`);
+      doc.moveDown(0.2);
+      rtl(`قبل: ${r.before || "—"}`);
+      doc.moveDown(0.2);
+      rtl(`بعد: ${r.after || "—"}`);
+      doc.moveDown(0.2);
+      rtl(`السبب: ${r.reason || "—"}`);
+      doc.moveDown(0.6);
+    });
+
+    line();
+
+    doc.fontSize(13);
+    rtl("خامسًا: توصيات تنفيذية", { underline: true });
+    doc.moveDown(0.5);
+    doc.fontSize(11);
+    const actions = report.recommended_actions || [];
+    if (!actions.length) rtl("—");
+    actions.forEach((a) => rtl(`• ${a}`));
+
+    line();
+
+    doc.fontSize(13);
+    rtl("سادسًا: خاتمة", { underline: true });
+    doc.moveDown(0.5);
+    doc.fontSize(11);
+    rtl(report.closing_note || "—");
+
+    doc.moveDown(1.2);
+    doc.fillColor("#6B7280");
+    doc.fontSize(9);
+    rtl("© حِمى — منصة قياس الجاهزية التنظيمية");
+
+    doc.end();
+  } catch (e) {
+    return res.status(e?.status || 500).json({
+      error: e?.message || "Server error",
+      status: e?.status,
+      code: e?.code,
+    });
+  }
+});
+
+// ✅ لازم يكون آخر شيء
+const PORT = process.env.PORT || 3001;
+app.listen(PORT, () => console.log("✅ Server running on http://localhost:" + PORT));
